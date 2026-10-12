@@ -1,0 +1,101 @@
+services:
+  # Zookeeper (обязательный для Kafka)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  # Брокер Kafka
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  # Создание топика transactions при старте
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: on-failure
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --describe --topic transactions
+      "
+
+  # Веб-интерфейс для просмотра топиков
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+  # ClickHouse: таблицы создаются скриптами из sql/ при первом старте
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+    ports:
+      - "8123:8123"   # HTTP
+      - "9000:9000"   # native (clickhouse-client)
+    environment:
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - ./sql/01_ddl.sql:/docker-entrypoint-initdb.d/01_ddl.sql:ro
+      - ./sql/02_ddl_optimized.sql:/docker-entrypoint-initdb.d/02_ddl_optimized.sql:ro
+      - ./sql:/sql:ro
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "clickhouse", "--password", "clickhouse", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Загрузка CSV в Kafka. Запускается вручную: docker compose run --rm producer
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    profiles: ["producer"]
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: transactions
+      CSV_PATH: /data/train.csv.xz
+    volumes:
+      - ./data:/data:ro
+
+volumes:
+  clickhouse_data:
